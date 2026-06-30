@@ -62,7 +62,7 @@ Preferences prefs;
 #define DSP_BLOCK_SAMPLES 1600
 #define CNN_WINDOW_SEC    1
 #define CNN_SAMPLES       16000
-#define I2S_READ_CHUNK    512
+#define I2S_READ_CHUNK    400
 
 
 // INMP441 usually arrives as 24-bit data inside a 32-bit slot.
@@ -288,18 +288,23 @@ int16_t highPassAndMonitor(int16_t raw16) {
 }
 
 
-// ======================= I2S SETUP =======================
 bool setupI2S() {
-  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
+  // Custom channel config to allocate larger DMA buffers in background
+  i2s_chan_config_t chan_cfg = {
+      .id = I2S_NUM_0,
+      .role = I2S_ROLE_MASTER,
+      .dma_desc_num = 16,     // Increase to 16 descriptors (from default 4) to store more background audio
+      .dma_frame_num = 400,   // Match our custom chunk size (400)
+      .auto_clear_after_cb = false
+  };
 
+  esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
 
   if (err != ESP_OK) {
     Serial.print("I2S channel creation failed: ");
     Serial.println((int)err);
     return false;
   }
-
 
   i2s_std_config_t std_cfg = {
       .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
@@ -318,10 +323,8 @@ bool setupI2S() {
       },
   };
 
-
   // L/R is tied to GND in your wiring, so use LEFT.
   std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-
 
   err = i2s_channel_init_std_mode(rx_handle, &std_cfg);
   if (err != ESP_OK) {
@@ -330,7 +333,6 @@ bool setupI2S() {
     return false;
   }
 
-
   err = i2s_channel_enable(rx_handle);
   if (err != ESP_OK) {
     Serial.print("I2S channel enable failed: ");
@@ -338,8 +340,7 @@ bool setupI2S() {
     return false;
   }
 
-
-  Serial.println("I2S microphone initialized.");
+  Serial.println("I2S microphone initialized with custom DMA buffers.");
   return true;
 }
 
@@ -553,8 +554,6 @@ float goertzelEnergy(const int16_t* data, int start, int length, float targetFre
   if (power < 0) power = 0;
   return power;
 }
-
-
 // ======================= DSP FEATURES =======================
 void computeDSP() {
   double sumSquares = 0.0;
@@ -563,33 +562,27 @@ void computeDSP() {
   int32_t clipCount = 0;
   int32_t zeroCount = 0;
 
-
   for (int i = 0; i < DSP_BLOCK_SAMPLES; i++) {
     int32_t s = dspBlock[i];
     int32_t r = rawBlock[i];
     int32_t a = abs(s);
 
-
     if (a > peakAbs) peakAbs = a;
     if (r > 32000 || r < -32000) clipCount++;
     if (r > -4 && r < 4) zeroCount++;
-
 
     float x = s / 32768.0f;
     sumSquares += x * x;
     sumRaw += r;
   }
 
-
   float rms = sqrt(sumSquares / DSP_BLOCK_SAMPLES);
   if (rms < 0.000001f) rms = 0.000001f;
   if (peakAbs < 1) peakAbs = 1;
 
-
   g_rmsDbFs = 20.0f * log10(rms);
   g_peakDbFs = 20.0f * log10(peakAbs / 32768.0f);
   g_splFast = g_rmsDbFs + CAL_OFFSET_DB;
-
 
   // Slow SPL smoothing for stable display.
   static bool splStarted = false;
@@ -600,15 +593,12 @@ void computeDSP() {
     g_spl = 0.85f * g_spl + 0.15f * g_splFast;
   }
 
-
   g_peakDb = g_peakDbFs + CAL_OFFSET_DB;
   g_crestDb = g_peakDbFs - g_rmsDbFs;
-
 
   g_clipPct = 100.0f * clipCount / DSP_BLOCK_SAMPLES;
   g_zeroPct = 100.0f * zeroCount / DSP_BLOCK_SAMPLES;
   g_dcOffset = (float)(sumRaw / DSP_BLOCK_SAMPLES);
-
 
   // Mic quality: 100 means healthy signal. Low means loose wire, wrong channel, clipping, or no data.
   g_micQuality = 100.0f;
@@ -618,7 +608,6 @@ void computeDSP() {
   if (abs((int)g_dcOffset) > 12000) g_micQuality -= 25.0f;
   if (g_micQuality < 0.0f) g_micQuality = 0.0f;
 
-
   // Noise floor learner. It only learns during low-energy/non-spike periods.
   bool likelyQuiet = (g_splFast < WARNING_DB_MIN && g_clipPct < 1.0f && g_crestDb < 18.0f);
   if (likelyQuiet) {
@@ -627,29 +616,35 @@ void computeDSP() {
   g_snrDb = g_rmsDbFs - g_noiseDbFs;
   if (g_snrDb < 0.0f) g_snrDb = 0.0f;
 
+  // ==================== IMPROVED FFT-BASED SPEECH BAND RATIO ====================
+  // Run a single 512-point FFT on the dspBlock (under 1ms execution)
+  float fft_re[512];
+  float fft_im[512];
+  float power[257];
 
-  // Approximate speech-band ratio.
-  float speechEnergy = 0;
-  speechEnergy += goertzelEnergy(dspBlock, 0, 512, 400);
-  speechEnergy += goertzelEnergy(dspBlock, 0, 512, 800);
-  speechEnergy += goertzelEnergy(dspBlock, 0, 512, 1200);
-  speechEnergy += goertzelEnergy(dspBlock, 0, 512, 2000);
-  speechEnergy += goertzelEnergy(dspBlock, 0, 512, 3200);
+  for (int i = 0; i < 512; i++) {
+    float w = 0.5f * (1.0f - cos(2.0f * PI * i / 511.0f)); // Hanning Window
+    fft_re[i] = (dspBlock[i] / 32768.0f) * w;
+    fft_im[i] = 0.0f;
+  }
+  fastFFT(fft_re, fft_im, 512);
 
+  float total_power = 0.0f;
+  for (int k = 0; k < 257; k++) {
+    power[k] = (fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k]);
+    total_power += power[k];
+  }
+  if (total_power < 1e-12f) total_power = 1e-12f;
 
-  float otherEnergy = 0;
-  otherEnergy += goertzelEnergy(dspBlock, 0, 512, 80);
-  otherEnergy += goertzelEnergy(dspBlock, 0, 512, 150);
-  otherEnergy += goertzelEnergy(dspBlock, 0, 512, 5000);
-  otherEnergy += goertzelEnergy(dspBlock, 0, 512, 7000);
+  // Calculate integrated energy of the actual, full speech band (300 Hz to 3400 Hz)
+  float e_speech = getBandEnergy(power, 300.0f, 3400.0f);
+  
+  // Faction of speech-band energy over the total spectrum
+  g_speechRatio = e_speech / total_power;
 
-
-  g_speechRatio = speechEnergy / (speechEnergy + otherEnergy + 0.000001f);
   if (g_speechRatio < 0) g_speechRatio = 0;
   if (g_speechRatio > 1) g_speechRatio = 1;
 }
-
-
 // ======================= MEL SCALE HELPERS =======================
 float hzToMel(float hz) {
   return 2595.0f * log10(1.0f + hz / 700.0f);
@@ -1843,48 +1838,43 @@ void setup() {
 
 // ======================= MAIN LOOP =======================
 void loop() {
+  // 1. Let the web server handle clients quickly
   server.handleClient();
 
+  // 2. Read the next 100ms block. This function will AUTOMATICALLY 
+  // block the CPU and wait for exactly 100ms of real-time audio.
+  readAudio100msBlock();
 
-  unsigned long now = millis();
-
-
-  if (now - lastDspMs >= DSP_BLOCK_MS) {
-    lastDspMs = now;
-
-
-    readAudio100msBlock();
-
-
+  // 3. Process and stream the audio block immediately (no software timers needed)
 #if USE_CLEAN_AUDIO_FOR_LIVE
-    pushLiveBlock(monitorBlock);
+  pushLiveBlock(monitorBlock);
 #else
-    pushLiveBlock(rawBlock);
+  pushLiveBlock(rawBlock);
 #endif
 
+  appendToRecordingFromBlock();
+  computeDSP();
+  updateFusionLogic();
 
-    appendToRecordingFromBlock();
-    computeDSP();
-    updateFusionLogic();
-
-
-    static uint8_t serialDivider = 0;
-    serialDivider++;
-    if (serialDivider >= 10) {
-      serialDivider = 0;
-      Serial.print("State: "); Serial.print(stateName(displayState));
-      Serial.print(" | SPL: "); Serial.print(g_spl, 1);
-      Serial.print(" | Peak: "); Serial.print(g_peakDb, 1);
-      Serial.print(" | SNR: "); Serial.print(g_snrDb, 1);
-      Serial.print(" | MicQ: "); Serial.print(g_micQuality, 0);
-      Serial.print(" | Clip%: "); Serial.print(g_clipPct, 2);
-      Serial.print(" | CNN speech: "); Serial.println(g_cnnSpeech, 2);
-    }
+  // 4. Print serial logs periodically (every 10 blocks = exactly 1 second)
+  static uint8_t serialDivider = 0;
+  serialDivider++;
+  if (serialDivider >= 10) {
+    serialDivider = 0;
+    Serial.print("State: "); Serial.print(stateName(displayState));
+    Serial.print(" | SPL: "); Serial.print(g_spl, 1);
+    Serial.print(" | Peak: "); Serial.print(g_peakDb, 1);
+    Serial.print(" | SNR: "); Serial.print(g_snrDb, 1);
+    Serial.print(" | MicQ: "); Serial.print(g_micQuality, 0);
+    Serial.print(" | Clip%: "); Serial.print(g_clipPct, 2);
+    Serial.print(" | CNN speech: "); Serial.println(g_cnnSpeech, 2);
   }
 
-
-  if (now - lastCnnMs >= 1000) {
-    lastCnnMs = now;
+  // 5. Run the CNN inference periodically (every 10 blocks = exactly 1 second)
+  static uint8_t cnnDivider = 0;
+  cnnDivider++;
+  if (cnnDivider >= 10) {
+    cnnDivider = 0;
     runCNN();
   }
 }
