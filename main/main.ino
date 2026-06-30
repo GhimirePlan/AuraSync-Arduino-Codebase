@@ -17,7 +17,7 @@ i2s_chan_handle_t rx_handle = NULL;
 
 
 #include "model_data.h"
-
+#include "aurasync_feature_params.h"
 
 // ==============================================================
 // AuraSync ESP32-S3 N8R8 + INMP441 FINAL DEPLOYABLE FIRMWARE
@@ -113,7 +113,7 @@ const float SPIKE_MIN_CREST_DB        = 10.0f;
 
 // CNN can be noisy unless the model exactly matches this preprocessing.
 // Keep 0 for deployment safety. Set to 1 only after retraining/validation.
-#define USE_CNN_IN_DECISION 0
+#define USE_CNN_IN_DECISION 1
 const float CNN_SPEECH_TH       = 0.70f;
 const float CNN_LOUD_TH         = 0.75f;
 const float CNN_SPIKE_TH        = 0.80f;
@@ -147,8 +147,8 @@ int32_t i2sRaw[I2S_READ_CHUNK];
 int16_t rawBlock[DSP_BLOCK_SAMPLES];
 int16_t dspBlock[DSP_BLOCK_SAMPLES];       // cleaned block used for metrics/model
 int16_t monitorBlock[DSP_BLOCK_SAMPLES];   // listenable PCM for dashboard
-int16_t cnnWindow[CNN_SAMPLES];
-int16_t cnnOrdered[CNN_SAMPLES];
+int16_t* cnnWindow = nullptr;
+int16_t* cnnOrdered = nullptr;
 
 
 int cnnWriteIndex = 0;
@@ -184,8 +184,8 @@ TfLiteTensor* outputTensor = nullptr;
 bool tinyMlOk = false;
 
 
-constexpr int kTensorArenaSize = 120 * 1024;
-alignas(16) uint8_t tensorArena[kTensorArenaSize];
+constexpr int kTensorArenaSize = 64 * 1024; // 64 KB is more than enough for a 10 KB model!
+uint8_t* tensorArena = nullptr;
 
 
 // ======================= METRICS =======================
@@ -692,85 +692,85 @@ void setInputFeature(int index, float featureValue) {
 
 
 // ======================= CNN FEATURE EXTRACTION =======================
-void extractFeaturesToTensor() {
-  if (inputTensor == nullptr) return;
+// void extractFeaturesToTensor() {
+//   if (inputTensor == nullptr) return;
 
 
-  // Important fix: cnnWindow is circular. Convert it to chronological order.
-  for (int i = 0; i < CNN_SAMPLES; i++) {
-    int idx = cnnWriteIndex + i;
-    if (idx >= CNN_SAMPLES) idx -= CNN_SAMPLES;
-    cnnOrdered[i] = cnnWindow[idx];
-  }
+//   // Important fix: cnnWindow is circular. Convert it to chronological order.
+//   for (int i = 0; i < CNN_SAMPLES; i++) {
+//     int idx = cnnWriteIndex + i;
+//     if (idx >= CNN_SAMPLES) idx -= CNN_SAMPLES;
+//     cnnOrdered[i] = cnnWindow[idx];
+//   }
 
 
-  int dimsCount = inputTensor->dims->size;
-  int totalElements = 1;
-  for (int i = 0; i < dimsCount; i++) totalElements *= inputTensor->dims->data[i];
+//   int dimsCount = inputTensor->dims->size;
+//   int totalElements = 1;
+//   for (int i = 0; i < dimsCount; i++) totalElements *= inputTensor->dims->data[i];
 
 
-  int timeFrames = 1;
-  int freqBins = totalElements;
+//   int timeFrames = 1;
+//   int freqBins = totalElements;
 
 
-  if (dimsCount == 4) {
-#if MODEL_TIME_AXIS_FIRST
-    timeFrames = inputTensor->dims->data[1];
-    freqBins = inputTensor->dims->data[2];
-#else
-    freqBins = inputTensor->dims->data[1];
-    timeFrames = inputTensor->dims->data[2];
-#endif
-  }
-  else if (dimsCount == 3) {
-    timeFrames = inputTensor->dims->data[1];
-    freqBins = inputTensor->dims->data[2];
-  }
-  else if (dimsCount == 2) {
-    freqBins = inputTensor->dims->data[1];
-    timeFrames = 1;
-  }
+//   if (dimsCount == 4) {
+// #if MODEL_TIME_AXIS_FIRST
+//     timeFrames = inputTensor->dims->data[1];
+//     freqBins = inputTensor->dims->data[2];
+// #else
+//     freqBins = inputTensor->dims->data[1];
+//     timeFrames = inputTensor->dims->data[2];
+// #endif
+//   }
+//   else if (dimsCount == 3) {
+//     timeFrames = inputTensor->dims->data[1];
+//     freqBins = inputTensor->dims->data[2];
+//   }
+//   else if (dimsCount == 2) {
+//     freqBins = inputTensor->dims->data[1];
+//     timeFrames = 1;
+//   }
 
 
-  if (timeFrames < 1) timeFrames = 1;
-  if (freqBins < 1) freqBins = 1;
+//   if (timeFrames < 1) timeFrames = 1;
+//   if (freqBins < 1) freqBins = 1;
 
 
-  const int frameLen = 512;
-  int hop = 0;
-  if (timeFrames > 1) hop = (CNN_SAMPLES - frameLen) / (timeFrames - 1);
+//   const int frameLen = 512;
+//   int hop = 0;
+//   if (timeFrames > 1) hop = (CNN_SAMPLES - frameLen) / (timeFrames - 1);
 
 
-  float melMin = hzToMel(80);
-  float melMax = hzToMel(7600);
-  int featureIndex = 0;
+//   float melMin = hzToMel(80);
+//   float melMax = hzToMel(7600);
+//   int featureIndex = 0;
 
 
-  for (int t = 0; t < timeFrames; t++) {
-    int start = t * hop;
-    if (start < 0) start = 0;
-    if (start + frameLen > CNN_SAMPLES) start = CNN_SAMPLES - frameLen;
+//   for (int t = 0; t < timeFrames; t++) {
+//     int start = t * hop;
+//     if (start < 0) start = 0;
+//     if (start + frameLen > CNN_SAMPLES) start = CNN_SAMPLES - frameLen;
 
 
-    for (int b = 0; b < freqBins; b++) {
-      float mel = melMin + (melMax - melMin) * (b + 1) / (freqBins + 1);
-      float freq = melToHz(mel);
-      float energy = goertzelEnergy(cnnOrdered, start, frameLen, freq);
-      float logEnergy = log(energy + 0.000001f);
-      float normalized = normalizeFeature(logEnergy);
+//     for (int b = 0; b < freqBins; b++) {
+//       float mel = melMin + (melMax - melMin) * (b + 1) / (freqBins + 1);
+//       float freq = melToHz(mel);
+//       float energy = goertzelEnergy(cnnOrdered, start, frameLen, freq);
+//       float logEnergy = log(energy + 0.000001f);
+//       float normalized = normalizeFeature(logEnergy);
 
 
-      if (featureIndex < totalElements) setInputFeature(featureIndex, normalized);
-      featureIndex++;
-    }
-  }
+//       if (featureIndex < totalElements) setInputFeature(featureIndex, normalized);
+//       featureIndex++;
+//     }
+//   }
 
 
-  while (featureIndex < totalElements) {
-    setInputFeature(featureIndex, 0.0f);
-    featureIndex++;
-  }
-}
+//   while (featureIndex < totalElements) {
+//     setInputFeature(featureIndex, 0.0f);
+//     featureIndex++;
+//   }
+// }
 
 
 float getOutputScoreRaw(int index) {
@@ -830,27 +830,191 @@ void normalizeCnnOutputs(float raw0, float raw1, float raw2, float raw3) {
   g_cnnLoud = e2 / es;
   g_cnnSpike = e3 / es;
 }
-
-
 void runCNN() {
   if (!tinyMlOk || interpreter == nullptr || inputTensor == nullptr || outputTensor == nullptr) return;
 
-
-  extractFeaturesToTensor();
-
-
-  TfLiteStatus invokeStatus = interpreter->Invoke();
-  if (invokeStatus != kTfLiteOk) {
-    Serial.println("CNN Invoke failed");
+  // Allocate temporary ordered buffer dynamically inside the function
+  int16_t* cnnOrdered = (int16_t*)heap_caps_malloc(CNN_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  if (cnnOrdered == nullptr) {
+    Serial.println("Error: cnnOrdered allocation failed.");
     return;
   }
 
+  // 1. Re-order the circular buffer into chronological order
+  for (int i = 0; i < CNN_SAMPLES; i++) {
+    int idx = cnnWriteIndex + i;
+    if (idx >= CNN_SAMPLES) idx -= CNN_SAMPLES;
+    cnnOrdered[i] = cnnWindow[idx];
+  }
 
+  // 2. Extract Time-Domain Features (RMS Mean/Std/Max, Peak, Crest, ZCR)
+  float rms_frames[61];
+  float zcr_frames[61];
+  float rms_sum = 0.0f;
+  float zcr_sum = 0.0f;
+  float rms_max = 0.0f;
+  float peak = 0.0f;
+
+  for (int f = 0; f < 61; f++) {
+    int start = f * 256; // 50% overlap hop
+    double sum_sq = 0.0;
+    int zcr_count = 0;
+
+    for (int i = 0; i < 512; i++) {
+      float s = cnnOrdered[start + i] / 32768.0f; // Scale to [-1.0, 1.0]
+      sum_sq += s * s;
+      float abs_s = abs(s);
+      if (abs_s > peak) peak = abs_s;
+
+      if (i > 0) {
+        bool sign1 = (cnnOrdered[start + i] >= 0);
+        bool sign2 = (cnnOrdered[start + i - 1] >= 0);
+        if (sign1 != sign2) zcr_count++;
+      }
+    }
+    rms_frames[f] = sqrt(sum_sq / 512.0) + 1e-12f;
+    zcr_frames[f] = (float)zcr_count / 511.0f;
+
+    rms_sum += rms_frames[f];
+    zcr_sum += zcr_frames[f];
+    if (rms_frames[f] > rms_max) rms_max = rms_frames[f];
+  }
+
+  float rms_mean = rms_sum / 61.0f;
+  float zcr_mean = zcr_sum / 61.0f;
+
+  float rms_var_sum = 0.0f;
+  for (int f = 0; f < 61; f++) {
+    float diff = rms_frames[f] - rms_mean;
+    rms_var_sum += diff * diff;
+  }
+  float rms_std = sqrt(rms_var_sum / 61.0f);
+  float crest = peak / (rms_mean + 1e-9f);
+
+  // 3. Compute Welch's Power Spectrum (Average of 61 FFT Frames)
+  float avg_power[257] = {0};
+  float fft_re[512];
+  float fft_im[512];
+
+  for (int f = 0; f < 61; f++) {
+    int start = f * 256;
+    for (int i = 0; i < 512; i++) {
+      float w = 0.5f * (1.0f - cos(2.0f * PI * i / 511.0f)); // Hanning Window
+      fft_re[i] = (cnnOrdered[start + i] / 32768.0f) * w;
+      fft_im[i] = 0.0f;
+    }
+    fastFFT(fft_re, fft_im, 512);
+    for (int k = 0; k < 257; k++) {
+      avg_power[k] += (fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k]);
+    }
+  }
+  for (int k = 0; k < 257; k++) avg_power[k] /= 61.0f;
+
+  // 4. Compute Spectral Ratios and Statistics
+  float total_power = 0.0f;
+  for (int k = 0; k < 257; k++) total_power += avg_power[k];
+  if (total_power < 1e-12f) total_power = 1e-12f;
+
+  float e_sub80 = getBandEnergy(avg_power, 0, 80);
+  float e_low = getBandEnergy(avg_power, 80, 300);
+  float e_speech_low = getBandEnergy(avg_power, 300, 1000);
+  float e_speech_high = getBandEnergy(avg_power, 1000, 3400);
+  float e_high = getBandEnergy(avg_power, 3400, 8000);
+  float e_speech = e_speech_low + e_speech_high;
+
+  float sub80_ratio = e_sub80 / total_power;
+  float low80_300_ratio = e_low / total_power;
+  float speech300_1000_ratio = e_speech_low / total_power;
+  float speech1000_3400_ratio = e_speech_high / total_power;
+  float high3400_8000_ratio = e_high / total_power;
+  float speech_total_ratio = e_speech / total_power;
+
+  // Spectral Centroid
+  float centroid_sum = 0.0f;
+  for (int k = 0; k < 257; k++) centroid_sum += (k * 31.25f) * avg_power[k];
+  float centroid_norm = (centroid_sum / total_power) / 8000.0f;
+
+  // Spectral Rolloff (85% energy)
+  float cumulative_sum = 0.0f;
+  float target_energy = 0.85f * total_power;
+  float rolloff85 = 0.0f;
+  for (int k = 0; k < 257; k++) {
+    cumulative_sum += avg_power[k];
+    if (cumulative_sum >= target_energy) {
+      rolloff85 = k * 31.25f;
+      break;
+    }
+  }
+  float rolloff85_norm = rolloff85 / 8000.0f;
+
+  // Spectral Flatness
+  double log_sum = 0.0;
+  for (int k = 0; k < 257; k++) log_sum += log(avg_power[k] + 1e-12f);
+  float flatness = exp(log_sum / 257.0f) / ((total_power / 257.0f) + 1e-12f);
+
+  // Spectral Entropy
+  double entropy_sum = 0.0;
+  for (int k = 0; k < 257; k++) {
+    float p = avg_power[k] / total_power;
+    entropy_sum += p * (log(p + 1e-12f) / log(2.0f));
+  }
+  float entropy = -entropy_sum / (log(257.0f) / log(2.0f));
+
+  // 5. Package Features into the 28-element Array
+  float feats[28];
+  feats[0] = log1p(rms_mean * 1000.0f);
+  feats[1] = log1p(rms_std * 1000.0f);
+  feats[2] = log1p(rms_max * 1000.0f);
+  feats[3] = log1p(peak * 1000.0f);
+  feats[4] = fminf(crest, 50.0f) / 50.0f;
+  feats[5] = zcr_mean;
+  feats[6] = sub80_ratio;
+  feats[7] = low80_300_ratio;
+  feats[8] = speech300_1000_ratio;
+  feats[9] = speech1000_3400_ratio;
+  feats[10] = high3400_8000_ratio;
+  feats[11] = speech_total_ratio;
+  feats[12] = centroid_norm;
+  feats[13] = rolloff85_norm;
+  feats[14] = flatness;
+  feats[15] = entropy;
+
+  // 12 Band Log Energies
+  const float BAND_EDGES[] = {0.0f, 125.0f, 250.0f, 500.0f, 750.0f, 1000.0f, 1500.0f, 2000.0f, 3000.0f, 4000.0f, 5000.0f, 6000.0f, 8000.0f};
+  for (int i = 0; i < 12; i++) {
+    float e = getBandEnergy(avg_power, BAND_EDGES[i], BAND_EDGES[i+1]);
+    feats[16 + i] = log1p(1000.0f * e / total_power);
+  }
+
+  // 6. Standardize and Quantize to Model's INT8 Input Tensor
+  const float input_scale = inputTensor->params.scale;
+  const int input_zero = inputTensor->params.zero_point;
+
+  for (int i = 0; i < 28; i++) {
+    float norm = (feats[i] - AURASYNC_FEATURE_MEAN[i]) / AURASYNC_FEATURE_STD[i];
+    int q = (int)roundf(norm / input_scale + input_zero);
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
+    inputTensor->data.int8[i] = (int8_t)q;
+  }
+
+  // 7. Invoke the Interpreter
+  TfLiteStatus invokeStatus = interpreter->Invoke();
+  if (invokeStatus != kTfLiteOk) {
+    Serial.println("CNN Invoke failed");
+    free(cnnOrdered); // Prevent memory leaks on failure
+    return;
+  }
+
+  // 8. Retrieve and Normalize Model Outputs
   float r0 = getOutputScoreRaw(CLASS_SMOOTH);
   float r1 = getOutputScoreRaw(CLASS_WARNING_SPEECH);
   float r2 = getOutputScoreRaw(CLASS_LOUD);
   float r3 = getOutputScoreRaw(CLASS_SPIKE);
   normalizeCnnOutputs(r0, r1, r2, r3);
+
+  // Free the temporary ordered buffer to keep PSRAM clean
+  free(cnnOrdered);
 }
 
 
@@ -1561,13 +1725,65 @@ async function resetNoise() {
   server.send(200, "text/html", html);
 }
 
+// Lightweight in-place Radix-2 FFT (under 1ms execution on ESP32-S3)
+void fastFFT(float* re, float* im, int n) {
+  int i, j, k;
+  for (i = 1, j = n / 2; i < n - 1; i++) {
+    if (i < j) {
+      float temp = re[i]; re[i] = re[j]; re[j] = temp;
+      temp = im[i]; im[i] = im[j]; im[j] = temp;
+    }
+    k = n / 2;
+    while (k <= j) { j -= k; k /= 2; }
+    j += k;
+  }
+  for (int size = 2; size <= n; size *= 2) {
+    int halfsize = size / 2;
+    float tablestep = 2.0f * PI / size;
+    for (i = 0; i < n; i += size) {
+      for (j = i; j < i + halfsize; j++) {
+        float angle = (j - i) * tablestep;
+        float c = cos(angle);
+        float s = -sin(angle);
+        float t_re = re[j + halfsize] * c - im[j + halfsize] * s;
+        float t_im = re[j + halfsize] * s + im[j + halfsize] * c;
+        re[j + halfsize] = re[j] - t_re;
+        im[j + halfsize] = im[j] - t_im;
+        re[j] += t_re;
+        im[j] += t_im;
+      }
+    }
+  }
+}
 
+// Integrates energy between two target frequencies using our 31.25Hz bin resolution
+float getBandEnergy(const float* power, float f1, float f2) {
+  float sum = 0.0f;
+  for (int k = 0; k < 257; k++) {
+    float freq = k * 31.25f; // Bin width = 16000 / 512
+    if (freq >= f1 && freq < f2) {
+      sum += power[k];
+    }
+  }
+  return sum;
+}
 // ======================= SETUP =======================
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  cnnWindow = (int16_t*)heap_caps_malloc(CNN_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  cnnOrdered = (int16_t*)heap_caps_malloc(CNN_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  tensorArena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  // Safety check to ensure allocation succeeded
+  if (cnnWindow == nullptr || tensorArena == nullptr) {
+    Serial.println("CRITICAL ERROR: Failed to allocate memory in PSRAM!");
+    while (1) delay(1000);
+  }
 
+  // Clear the memory
+  memset(cnnWindow, 0, CNN_SAMPLES * sizeof(int16_t));
+  memset(tensorArena, 0, kTensorArenaSize);
   Serial.println();
   Serial.println("Starting AuraSync ESP32-S3 N8R8 Final Deploy Firmware...");
 
